@@ -1,0 +1,53 @@
+name: 🔍 Research + Listing Agent
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'    # every 6 hours
+  workflow_dispatch:
+
+concurrency:
+  group: research-agent
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Research Winning Products & Create Listings
+    runs-on: ubuntu-latest
+    timeout-minutes: 20        # research can take longer
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Run Research + Listing Agent
+        run: node scripts/run-agent.js research
+        env:
+          NODE_ENV: production
+          AI_PROVIDER:              ${{ secrets.AI_PROVIDER }}
+          ANTHROPIC_API_KEY:        ${{ secrets.ANTHROPIC_API_KEY }}
+          GROK_API_KEY:             ${{ secrets.GROK_API_KEY }}
+          GROK_MODEL:               ${{ secrets.GROK_MODEL }}
+          CLAUDE_MODEL:             ${{ secrets.CLAUDE_MODEL }}
+          SHOPIFY_SHOP_NAME:        ${{ secrets.SHOPIFY_SHOP_NAME }}
+          SHOPIFY_ACCESS_TOKEN:     ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOPIFY_CLIENT_ID:        ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET:    ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          ALIEXPRESS_APP_KEY:       ${{ secrets.ALIEXPRESS_APP_KEY }}
+          ALIEXPRESS_APP_SECRET:    ${{ secrets.ALIEXPRESS_APP_SECRET }}
+          ALIEXPRESS_AFFILIATE_ID:  ${{ secrets.ALIEXPRESS_AFFILIATE_ID }}
+          CJ_API_KEY:               ${{ secrets.CJ_API_KEY }}
+          CJ_EMAIL:                 ${{ secrets.CJ_EMAIL }}
+          MAX_PRODUCTS_PER_RUN:     ${{ secrets.MAX_PRODUCTS_PER_RUN }}
+          AUTO_PUBLISH_PRODUCTS:    ${{ secrets.AUTO_PUBLISH_PRODUCTS }}
+          DEFAULT_MARKUP_PERCENT:   ${{ secrets.DEFAULT_MARKUP_PERCENT }}
+          MIN_PROFIT_MARGIN:        ${{ secrets.MIN_PROFIT_MARGIN }}
+          SHIPPING_BUFFER:          ${{ secrets.SHIPPING_BUFFER }}
+          MAX_PRICE_MULTIPLIER:     ${{ secrets.MAX_PRICE_MULTIPLIER }}
+          SLACK_WEBHOOK_URL:        ${{ secrets.SLACK_WEBHOOK_URL }}

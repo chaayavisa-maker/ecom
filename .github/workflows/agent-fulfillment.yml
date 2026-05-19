@@ -1,0 +1,52 @@
+name: 🚚 Fulfillment Agent
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes
+  workflow_dispatch:          # manual trigger from GitHub UI
+
+concurrency:
+  group: fulfillment-agent
+  cancel-in-progress: false   # never cancel a fulfillment mid-run
+
+jobs:
+  run:
+    name: Process Unfulfilled Orders
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Run Fulfillment Agent
+        run: node scripts/run-agent.js fulfillment
+        env:
+          NODE_ENV: production
+          AI_PROVIDER:              ${{ secrets.AI_PROVIDER }}
+          ANTHROPIC_API_KEY:        ${{ secrets.ANTHROPIC_API_KEY }}
+          GROK_API_KEY:             ${{ secrets.GROK_API_KEY }}
+          GROK_MODEL:               ${{ secrets.GROK_MODEL }}
+          CLAUDE_MODEL:             ${{ secrets.CLAUDE_MODEL }}
+          SHOPIFY_SHOP_NAME:        ${{ secrets.SHOPIFY_SHOP_NAME }}
+          SHOPIFY_ACCESS_TOKEN:     ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOPIFY_CLIENT_ID:        ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET:    ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          SHOPIFY_WEBHOOK_SECRET:   ${{ secrets.SHOPIFY_WEBHOOK_SECRET }}
+          ALIEXPRESS_APP_KEY:       ${{ secrets.ALIEXPRESS_APP_KEY }}
+          ALIEXPRESS_APP_SECRET:    ${{ secrets.ALIEXPRESS_APP_SECRET }}
+          ALIEXPRESS_AFFILIATE_ID:  ${{ secrets.ALIEXPRESS_AFFILIATE_ID }}
+          CJ_API_KEY:               ${{ secrets.CJ_API_KEY }}
+          CJ_EMAIL:                 ${{ secrets.CJ_EMAIL }}
+          AUTO_FULFILL_ORDERS:      ${{ secrets.AUTO_FULFILL_ORDERS }}
+          DEFAULT_MARKUP_PERCENT:   ${{ secrets.DEFAULT_MARKUP_PERCENT }}
+          MIN_PROFIT_MARGIN:        ${{ secrets.MIN_PROFIT_MARGIN }}
+          SHIPPING_BUFFER:          ${{ secrets.SHIPPING_BUFFER }}
+          SLACK_WEBHOOK_URL:        ${{ secrets.SLACK_WEBHOOK_URL }}

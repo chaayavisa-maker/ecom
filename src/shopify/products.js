@@ -1,163 +1,150 @@
 /**
- * shopify/products.js — Shopify Product API Wrapper
+ * shopify/products.js — Shopify Product Helpers (CJS)
  *
- * New exports added:
- *  - updateProductImages(productId, variantImageMap)
- *  - bulkUpdatePrices(updates)
- *  - getProductWithImages(productId)
+ * Uses shopify-api-node (already in the project) — NOT axios.
+ * shopify-api-node API: shopify.product.create(), shopify.productImage.create(), etc.
  *
  * Improvements:
- *  - Proper rate-limit handling (Shopify: 2 req/s on REST, bucket on GraphQL)
- *  - All mutations use GraphQL where possible (more efficient, fewer API calls)
- *  - Image operations batch correctly
+ *  - createProduct() now accepts an images[] array (multi-image support)
+ *  - addImagesToProduct() — add images to an existing product
+ *  - replaceProductImages() — swap all images on a product
+ *  - updateVariantImage() — link a variant to a specific image
  */
 
-import { shopifyClient, graphqlClient } from './client.js';
-import logger from '../utils/logger.js';
+const { getShopifyClient } = require('./client');
+const logger = require('../utils/logger');
 
-// ─── REST helpers ─────────────────────────────────────────────────────────────
-
-/**
- * Create a product. Passes images array directly — Shopify handles upload.
- * NOTE: images must be publicly accessible URLs.
- */
-export async function createProduct(payload) {
-  const response = await shopifyClient.post('/products.json', { product: payload });
-  return response.data.product;
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 /**
- * Get a product including its images and variants.
+ * Create a Shopify product.
+ * Pass images as an array: [{ src, alt, position }]
+ * shopify-api-node accepts images[] directly on product.create().
  */
-export async function getProductWithImages(productId) {
-  const response = await shopifyClient.get(
-    `/products/${productId}.json?fields=id,title,images,variants,status`
-  );
-  return response.data.product;
+async function createProduct(payload) {
+  const shopify = getShopifyClient();
+  return shopify.product.create(payload);
+}
+
+async function getProduct(productId) {
+  const shopify = getShopifyClient();
+  return shopify.product.get(productId);
+}
+
+async function updateProduct(productId, payload) {
+  const shopify = getShopifyClient();
+  return shopify.product.update(productId, payload);
+}
+
+async function deleteProduct(productId) {
+  const shopify = getShopifyClient();
+  return shopify.product.delete(productId);
+}
+
+async function listProducts(params = {}) {
+  const shopify = getShopifyClient();
+  return shopify.product.list(params);
 }
 
 /**
- * Add additional images to an existing product.
- * Useful if you want to add images after initial creation,
- * or if the product was created with only one image.
+ * Add images to an existing product one-by-one.
+ * Used when images couldn't be included at creation time.
  *
- * @param {string|number} productId
+ * @param {number} productId
  * @param {Array<{src: string, alt?: string, position?: number}>} images
  */
-export async function addImagesToProduct(productId, images) {
+async function addImagesToProduct(productId, images) {
+  const shopify = getShopifyClient();
   const results = [];
+
   for (const image of images) {
     try {
-      const res = await shopifyClient.post(`/products/${productId}/images.json`, {
-        image: {
-          src: image.src,
-          alt: image.alt ?? '',
-          position: image.position,
-        },
+      const created = await shopify.productImage.create(productId, {
+        src: image.src,
+        alt: image.alt || '',
+        position: image.position,
       });
-      results.push(res.data.image);
+      results.push(created);
+      await sleep(300); // Respect rate limits
     } catch (err) {
-      logger.warn(`[Shopify] Failed to add image ${image.src}: ${err.message}`);
+      logger.warn(`[Shopify] Failed to add image to product ${productId}: ${err.message}`);
     }
   }
+
   return results;
 }
 
 /**
- * Update variant→image associations after product creation.
- * Shopify requires images to exist before they can be linked to variants.
+ * Delete all existing images on a product, then upload new ones.
  *
- * @param {string|number} productId
- * @param {object} variantImageMap  { variantId: imageId }
- */
-export async function updateProductImages(productId, variantImageMap) {
-  const updates = Object.entries(variantImageMap).map(([variantId, imageId]) =>
-    shopifyClient.put(`/products/${productId}/variants/${variantId}.json`, {
-      variant: { id: variantId, image_id: imageId },
-    })
-  );
-  await Promise.allSettled(updates);
-}
-
-/**
- * Replace ALL images on a product.
- * Deletes existing images first, then uploads new ones.
- *
- * @param {string|number} productId
+ * @param {number} productId
  * @param {Array<{src: string, alt?: string}>} newImages
  */
-export async function replaceProductImages(productId, newImages) {
-  // 1. Get current images
-  const product = await getProductWithImages(productId);
-  const existing = product.images ?? [];
+async function replaceProductImages(productId, newImages) {
+  const shopify = getShopifyClient();
 
-  // 2. Delete old images
-  await Promise.allSettled(
-    existing.map(img =>
-      shopifyClient.delete(`/products/${productId}/images/${img.id}.json`)
-    )
-  );
+  // Delete all existing images
+  const existing = await shopify.productImage.list(productId);
+  for (const img of existing) {
+    try {
+      await shopify.productImage.delete(productId, img.id);
+    } catch (err) {
+      logger.warn(`[Shopify] Could not delete image ${img.id}: ${err.message}`);
+    }
+  }
 
-  // 3. Upload new images
+  // Upload new ones
   return addImagesToProduct(productId, newImages);
 }
 
 /**
- * Bulk price update — more efficient than one PUT per product.
+ * Link a variant to a specific image by ID.
+ * Call after createProduct() once you have both variant IDs and image IDs.
  *
- * @param {Array<{variantId: string, price: string, compareAt?: string}>} updates
+ * @param {number} variantId
+ * @param {number} imageId
  */
-export async function bulkUpdatePrices(updates) {
-  // Use GraphQL productVariantsBulkUpdate for efficiency
-  const mutation = `
-    mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants {
-          id
-          price
-          compareAtPrice
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
+async function updateVariantImage(variantId, imageId) {
+  const shopify = getShopifyClient();
+  return shopify.productVariant.update(variantId, { image_id: imageId });
+}
 
-  // Group by productId first
-  const byProduct = {};
-  for (const u of updates) {
-    if (!byProduct[u.productId]) byProduct[u.productId] = [];
-    byProduct[u.productId].push({
-      id: `gid://shopify/ProductVariant/${u.variantId}`,
-      price: u.price,
-      compareAtPrice: u.compareAt,
-    });
-  }
-
+/**
+ * Bulk-update prices for multiple variants.
+ * Groups by product to minimise API calls.
+ *
+ * @param {Array<{variantId: number, price: string, compareAt?: string}>} updates
+ */
+async function bulkUpdateVariantPrices(updates) {
+  const shopify = getShopifyClient();
   const results = [];
-  for (const [productId, variants] of Object.entries(byProduct)) {
-    const res = await graphqlClient.request(mutation, {
-      productId: `gid://shopify/Product/${productId}`,
-      variants,
-    });
-    results.push(res);
+
+  for (const u of updates) {
+    try {
+      const updated = await shopify.productVariant.update(u.variantId, {
+        price: u.price,
+        compare_at_price: u.compareAt || null,
+      });
+      results.push(updated);
+      await sleep(500); // ~2 req/s
+    } catch (err) {
+      logger.warn(`[Shopify] Price update failed for variant ${u.variantId}: ${err.message}`);
+    }
   }
+
   return results;
 }
 
-export async function getProducts(params = {}) {
-  const query = new URLSearchParams(params).toString();
-  const response = await shopifyClient.get(`/products.json?${query}`);
-  return response.data.products;
-}
-
-export async function updateProduct(productId, payload) {
-  const response = await shopifyClient.put(`/products/${productId}.json`, { product: payload });
-  return response.data.product;
-}
-
-export async function deleteProduct(productId) {
-  await shopifyClient.delete(`/products/${productId}.json`);
-}
+module.exports = {
+  createProduct,
+  getProduct,
+  updateProduct,
+  deleteProduct,
+  listProducts,
+  addImagesToProduct,
+  replaceProductImages,
+  updateVariantImage,
+  bulkUpdateVariantPrices,
+};

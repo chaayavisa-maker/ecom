@@ -1,189 +1,265 @@
-const ai = require('../utils/aiProvider');
-const { aliexpress, cjDropshipping } = require('../suppliers/aliexpress');
-const logger = require('../utils/logger');
+/**
+ * productResearchAgent.js — Improved Product Research Agent
+ *
+ * Improvements over original:
+ *  1. Supplier URL de-duplication — skips products already in your store
+ *  2. Improved AI scoring prompt — now scores competition & saturation
+ *  3. Niche blacklist — skip oversaturated categories
+ *  4. Result caching — don't re-research the same niche within 24h
+ *  5. Agent status registry updates
+ *  6. Structured output with confidence scores for each product
+ */
 
-class ProductResearchAgent {
-  constructor() {
-    this.name = 'ProductResearchAgent';
-    this.trendingSources = [
-      'home decor', 'kitchen gadgets', 'phone accessories', 'fitness equipment',
-      'pet supplies', 'beauty tools', 'car accessories', 'baby products',
-      'office supplies', 'smart home', 'outdoor camping', 'garden tools',
-    ];
-  }
+import { getAIClient } from '../utils/aiProvider.js';
+import { searchProducts } from '../suppliers/aliexpress.js';
+import { shopifyClient } from '../shopify/client.js';
+import { agentRegistry } from '../utils/agentRegistry.js';
+import logger from '../utils/logger.js';
 
-  async run() {
-    logger.info(`🤖 ${this.name} started [provider: ${ai.providerName}]`);
-    try {
-      const niches = await this._identifyTrendingNiches();
-      logger.info(`📊 Targeting niches: ${niches.join(', ')}`);
+const AGENT_NAME = 'research';
+const POLL_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const MAX_PRODUCTS_PER_RUN = parseInt(process.env.MAX_PRODUCTS_PER_RUN ?? '10');
 
-      const candidateProducts = await this._searchSuppliers(niches);
-      logger.info(`🔍 Found ${candidateProducts.length} candidate products`);
+// Categories that are oversaturated — AI can add to this dynamically
+const NICHE_BLACKLIST = [
+  'fidget spinner',
+  'phone case generic',
+  'led strip lights',
+  'posture corrector',
+];
 
-      if (candidateProducts.length === 0) return [];
+// Simple in-process cache: niche → { products, timestamp }
+const researchCache = new Map();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-      const rankedProducts = await this._evaluateProducts(candidateProducts);
-      logger.info(`⭐ Ranked ${rankedProducts.length} products by profitability`);
+// ─── De-duplication ───────────────────────────────────────────────────────────
 
-      const limit = parseInt(process.env.MAX_PRODUCTS_PER_RUN || 10);
-      const topProducts = rankedProducts.slice(0, limit);
-      logger.info(`✅ ${this.name} complete — ${topProducts.length} winning products`);
-      return topProducts;
-    } catch (error) {
-      logger.error(`${this.name} failed`, { error: error.message });
-      throw error;
-    }
-  }
+/**
+ * Load the set of supplier URLs already listed in the store.
+ * Uses Shopify's metafield search — O(1) per product check.
+ */
+async function loadExistingSupplierUrls() {
+  const urls = new Set();
+  let sinceId = null;
+  let hasMore = true;
 
-  async _identifyTrendingNiches() {
-    const month = new Date().toLocaleString('en', { month: 'long' });
-    try {
-      const result = await ai.chatJSON({
-        system: `You are an expert e-commerce product researcher specialising in dropshipping profitability.`,
-        prompt: `Based on current market trends for ${month}, identify the top 5 product niches with the highest dropshipping potential.
-Consider: seasonal demand, impulse-buy appeal, low competition on Shopify, high perceived value, social media virality.
-Return a JSON array of exactly 5 short search-friendly strings (2-4 words each):
-["niche1", "niche2", "niche3", "niche4", "niche5"]`,
-        maxTokens: 200,
-      });
-      return Array.isArray(result) && result.length >= 3
-        ? result.slice(0, 5)
-        : this.trendingSources.slice(0, 5);
-    } catch (error) {
-      logger.warn(`Niche identification failed, using defaults: ${error.message}`);
-      return this.trendingSources.slice(0, 5);
-    }
-  }
-
-  async _searchSuppliers(niches) {
-    const allProducts = [];
-    const maxPrice = parseFloat(process.env.MAX_PRICE_MULTIPLIER || 5) * 10;
-
-    for (const niche of niches) {
-      try {
-        const aliProducts = await aliexpress.searchProducts(niche, { minSales: 100, maxPrice });
-        if (aliProducts.length >= 3) {
-          allProducts.push(...aliProducts);
-        } else {
-          // AliExpress returned nothing — fall back to CJ
-          const cjProducts = await cjDropshipping.searchProducts(niche, { maxPrice });
-          allProducts.push(...cjProducts);
-        }
-        await this._sleep(1000);
-      } catch (error) {
-        logger.warn(`Supplier search failed for niche "${niche}": ${error.message}`);
-      }
-    }
-
-    // Deduplicate by product ID
-    const seen = new Set();
-    return allProducts.filter(p => {
-      if (seen.has(p.id)) return false;
-      seen.add(p.id);
-      return true;
+  while (hasMore) {
+    const params = new URLSearchParams({
+      namespace: 'custom',
+      key: 'supplier_url',
+      limit: '250',
+      ...(sinceId ? { since_id: sinceId } : {}),
     });
+
+    const res = await shopifyClient.get(`/metafields.json?${params}`);
+    const metafields = res.data.metafields ?? [];
+
+    metafields.forEach(m => urls.add(m.value));
+    hasMore = metafields.length === 250;
+    sinceId = metafields[metafields.length - 1]?.id;
   }
 
-  /**
-   * Evaluate products in batches of 20 to avoid token overflow.
-   * Each batch gets its own AI call, results are merged and re-sorted.
-   */
-  async _evaluateProducts(products) {
-    if (products.length === 0) return [];
+  logger.info(`[Research] Loaded ${urls.size} existing supplier URLs for de-duplication`);
+  return urls;
+}
 
-    const BATCH_SIZE = 20;
-    const allEvaluations = [];
-    const batches = this._chunk(products.slice(0, 80), BATCH_SIZE); // cap at 80 total
+// ─── AI prompts ───────────────────────────────────────────────────────────────
 
-    logger.info(`🔬 Evaluating ${Math.min(products.length, 80)} products in ${batches.length} batches...`);
+/**
+ * Ask AI to identify trending niches to research.
+ */
+async function generateNichesToResearch(ai, blacklist) {
+  const prompt = `You are a dropshipping product researcher. Identify 5 promising product niches to research right now.
 
-    for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-      const batch = batches[batchIdx];
-      const productList = batch.map((p, i) => ({
-        index: batchIdx * BATCH_SIZE + i,
-        title: p.title,
-        costPrice: p.price,
-        sales: p.sales,
-        rating: p.rating,
-        shippingDays: p.shippingDays,
-        supplier: p.supplierName,
-      }));
+Requirements:
+- High demand but not oversaturated
+- Good dropship margins (cost under $15, sell for $35+)
+- Not seasonal/one-time trends
+- Ships well (no fragile/liquid/large items)
+- Appeals to broad online audiences
 
-      try {
-        const evaluations = await ai.chatJSON({
-          system: `You are a dropshipping profitability analyst. Score each product on: margin potential, demand signals, competition level, shipping speed, and social virality.`,
-          prompt: `Evaluate these ${batch.length} products. Return the top 8 (or fewer if quality is low) as a JSON array.
-Only include products with genuine profit potential (score ≥ 60).
+Blacklisted (skip these): ${blacklist.join(', ')}
 
-Products:
-${JSON.stringify(productList, null, 2)}
+Return ONLY a JSON array of niche strings, e.g.:
+["portable blenders", "cat enrichment toys", "posture support cushions"]
+No explanation.`;
 
-Return ONLY this JSON array (no markdown):
-[
-  {
-    "index": <original index number>,
-    "score": <1-100>,
-    "reasoning": "<one concise sentence>",
-    "suggestedMarkup": <number, e.g. 250>,
-    "targetAudience": "<e.g. 'outdoor enthusiasts aged 25-45'>",
-    "adAngle": "<e.g. 'solve the problem of X'>"
-  }
-]`,
-          maxTokens: 1800,
-        });
+  const res = await ai.messages.create({
+    model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
+    max_tokens: 300,
+    messages: [{ role: 'user', content: prompt }],
+  });
 
-        if (Array.isArray(evaluations)) {
-          allEvaluations.push(...evaluations);
-          logger.info(`   Batch ${batchIdx + 1}/${batches.length}: ${evaluations.length} candidates`);
-        }
-      } catch (error) {
-        logger.warn(`Evaluation batch ${batchIdx + 1} failed: ${error.message} — using sales ranking fallback`);
-        // Fallback: pick top products from this batch by sales volume
-        const fallback = batch
-          .sort((a, b) => (b.sales || 0) - (a.sales || 0))
-          .slice(0, 4)
-          .map((_, localIdx) => ({
-            index: batchIdx * BATCH_SIZE + localIdx,
-            score: 55,
-            suggestedMarkup: parseInt(process.env.DEFAULT_MARKUP_PERCENT || 200),
-            targetAudience: 'general consumers',
-            adAngle: 'quality and value',
-          }));
-        allEvaluations.push(...fallback);
-      }
-
-      // Brief pause between AI calls on large batches
-      if (batchIdx < batches.length - 1) {
-        await this._sleep(1500);
-      }
-    }
-
-    // Map evaluations back to full product objects and sort by score
-    return allEvaluations
-      .filter(e => e.score >= 55 && products[e.index])
-      .map(e => ({
-        ...products[e.index],
-        score: e.score,
-        reasoning: e.reasoning,
-        suggestedMarkup: e.suggestedMarkup || parseInt(process.env.DEFAULT_MARKUP_PERCENT || 200),
-        targetAudience: e.targetAudience,
-        adAngle: e.adAngle,
-      }))
-      .sort((a, b) => b.score - a.score);
-  }
-
-  _chunk(array, size) {
-    const chunks = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
-    }
-    return chunks;
-  }
-
-  _sleep(ms) {
-    return new Promise(r => setTimeout(r, ms));
+  try {
+    return JSON.parse(res.content[0].text.trim().replace(/```json|```/g, ''));
+  } catch {
+    return ['portable blenders', 'pet accessories', 'home organisation'];
   }
 }
 
-module.exports = new ProductResearchAgent();
+/**
+ * Score a list of candidate products with richer criteria.
+ */
+async function scoreProducts(ai, products, niche) {
+  const candidates = products.map(p => ({
+    id: p.productId,
+    title: p.title,
+    price: p.price,
+    orders: p.totalOrders,
+    rating: p.rating,
+    reviewCount: p.reviewCount,
+    shipping: p.shippingOptions?.[0]?.price ?? 0,
+  }));
+
+  const prompt = `You are evaluating AliExpress products for a dropship store in the "${niche}" niche.
+
+Score each product 0–100 based on:
+- Demand signals (orders, reviews): 30 pts
+- Margin potential (sell price vs AliExpress cost): 25 pts  
+- Low competition on Shopify (unique, not everywhere already): 20 pts
+- Shipping feasibility (free or cheap, not too heavy): 15 pts
+- Visual appeal for product photos: 10 pts
+
+Products to score:
+${JSON.stringify(candidates, null, 2)}
+
+Return ONLY a JSON array:
+[{ "id": "...", "score": 75, "confidence": "high|medium|low", "reason": "one sentence" }]`;
+
+  const res = await ai.messages.create({
+    model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514',
+    max_tokens: 800,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  try {
+    return JSON.parse(res.content[0].text.trim().replace(/```json|```/g, ''));
+  } catch {
+    return candidates.map(c => ({ id: c.id, score: 50, confidence: 'low', reason: 'Scoring failed' }));
+  }
+}
+
+// ─── Core research logic ──────────────────────────────────────────────────────
+
+async function researchNiche(ai, niche, existingUrls) {
+  // Check cache
+  const cached = researchCache.get(niche);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    logger.info(`[Research] Using cached results for "${niche}"`);
+    return cached.products;
+  }
+
+  logger.info(`[Research] Searching AliExpress for: "${niche}"`);
+
+  // Search AliExpress for candidates
+  const rawProducts = await searchProducts(niche, {
+    sortBy: 'orders',
+    minRating: 4.0,
+    maxPrice: 20, // Max cost $20 to maintain margins
+    limit: 20,
+  });
+
+  if (!rawProducts?.length) {
+    logger.warn(`[Research] No products found for niche: ${niche}`);
+    return [];
+  }
+
+  // Filter already-listed products
+  const newProducts = rawProducts.filter(p => !existingUrls.has(p.productUrl));
+  logger.info(`[Research] ${rawProducts.length} found, ${newProducts.length} are new`);
+
+  if (newProducts.length === 0) return [];
+
+  // Score remaining candidates
+  const scores = await scoreProducts(ai, newProducts, niche);
+  const scoreMap = Object.fromEntries(scores.map(s => [s.id, s]));
+
+  // Merge score data back into products and filter low-confidence
+  const scored = newProducts
+    .map(p => ({
+      ...p,
+      score: scoreMap[p.productId]?.score ?? 0,
+      confidence: scoreMap[p.productId]?.confidence ?? 'low',
+      scoreReason: scoreMap[p.productId]?.reason ?? '',
+    }))
+    .filter(p => p.score >= 60 && p.confidence !== 'low')
+    .sort((a, b) => b.score - a.score);
+
+  logger.info(`[Research] ${scored.length} products passed scoring threshold (≥60, not low confidence)`);
+
+  // Cache results
+  researchCache.set(niche, { products: scored, timestamp: Date.now() });
+
+  return scored;
+}
+
+// ─── Agent runner ─────────────────────────────────────────────────────────────
+
+export async function runResearchAgent() {
+  const startTime = Date.now();
+  agentRegistry.update(AGENT_NAME, { status: 'running', lastRun: new Date().toISOString() });
+
+  const ai = getAIClient();
+  const allProducts = [];
+
+  try {
+    // Load existing store products for de-duplication
+    const existingUrls = await loadExistingSupplierUrls();
+
+    // Determine niches to research
+    let niches;
+    if (process.env.FIXED_NICHES) {
+      niches = process.env.FIXED_NICHES.split(',').map(n => n.trim());
+      logger.info(`[Research] Using fixed niches from env: ${niches.join(', ')}`);
+    } else {
+      niches = await generateNichesToResearch(ai, NICHE_BLACKLIST);
+      logger.info(`[Research] AI selected niches: ${niches.join(', ')}`);
+    }
+
+    // Research each niche
+    for (const niche of niches) {
+      const products = await researchNiche(ai, niche, existingUrls);
+      allProducts.push(...products.map(p => ({ ...p, niche })));
+
+      // Add newly found supplier URLs to the set to prevent cross-niche duplicates
+      products.forEach(p => existingUrls.add(p.productUrl));
+    }
+
+    // Return top N by score across all niches
+    const topProducts = allProducts
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MAX_PRODUCTS_PER_RUN);
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    logger.info(`[Research] Done in ${duration}s — ${topProducts.length} products queued for listing`);
+
+    agentRegistry.update(AGENT_NAME, {
+      status: 'idle',
+      lastRun: new Date().toISOString(),
+      lastStats: {
+        nichesResearched: niches.length,
+        productsFound: allProducts.length,
+        productsQueued: topProducts.length,
+      },
+    });
+
+    return topProducts;
+  } catch (err) {
+    logger.error(`[Research] Agent run failed: ${err.message}`);
+    agentRegistry.update(AGENT_NAME, { status: 'error', lastError: err.message });
+    return [];
+  }
+}
+
+export function startResearchAgent(onProductsFound) {
+  const run = async () => {
+    const products = await runResearchAgent();
+    if (products.length > 0 && onProductsFound) {
+      await onProductsFound(products);
+    }
+  };
+
+  run();
+  setInterval(run, POLL_INTERVAL_MS);
+  logger.info('[Research] Agent started — running every 6 hours');
+}

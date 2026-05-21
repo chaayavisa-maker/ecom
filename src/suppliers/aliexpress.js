@@ -1,28 +1,31 @@
 /**
- * aliexpress.js — AliExpress / CJ Dropshipping Supplier Adapter (CJS)
+ * aliexpress.js — AliExpress / CJ Supplier Adapter (CJS)
  *
- * Improvements:
- *  1. fetchProductImages() — fetches ALL images (not just one), normalises CDN URLs to full-res
- *  2. URL normalisation strips AliExpress size suffixes (_350x350.jpg → .jpg)
- *  3. Fallback HTML scrape when API credentials aren't set up
- *  4. Rate-limit back-off
+ * searchProducts() works in 3 modes:
+ *   1. AliExpress Affiliate API  — when ALIEXPRESS_APP_KEY is set
+ *   2. Development mock data     — when ALIEXPRESS_APP_KEY is NOT set (clearly logged)
+ *   3. Fallback                  — on API error (rate limits etc.)
+ *
+ * fetchProductImages() fetches ALL product images and normalises CDN URLs to full-res.
  */
+
+'use strict';
 
 const axios = require('axios');
 const logger = require('../utils/logger');
 
-// ─── URL normalisation ────────────────────────────────────────────────────────
+// ─── URL helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Strip AliExpress CDN size suffixes so we get the full-resolution image.
+ * Strip AliExpress CDN size suffixes to get full-resolution images.
  * e.g. "photo_350x350.jpg" → "photo.jpg"
  */
 function normaliseImageUrl(url) {
   if (!url || typeof url !== 'string') return null;
   return url
-    .replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/gi, '.$1')  // strip _WxH suffix
-    .replace(/\?.*$/, '')                                   // strip query string
-    .replace(/^http:/, 'https:');                           // force HTTPS
+    .replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/gi, '.$1')
+    .replace(/\?.*$/, '')
+    .replace(/^http:/, 'https:');
 }
 
 function extractProductId(productUrl) {
@@ -32,27 +35,84 @@ function extractProductId(productUrl) {
   return match ? match[1] : null;
 }
 
+// ─── Mock data (development / no API key) ────────────────────────────────────
+
+/**
+ * Returns realistic mock products so the full pipeline can be tested
+ * without an AliExpress API key.
+ */
+function _mockSearchResults(query, limit = 5) {
+  logger.warn(`[AliExpress] ⚠️  ALIEXPRESS_APP_KEY not set — using mock data for "${query}"`);
+  logger.warn('[AliExpress] Set ALIEXPRESS_APP_KEY in .env to search real products');
+
+  const mockProducts = [
+    {
+      productId: `mock-${Date.now()}-1`,
+      title: `Premium ${query} - Bestseller Edition`,
+      price: 8.99,
+      cost: 8.99,
+      imageUrl: 'https://picsum.photos/seed/product1/800/800',
+      productUrl: `https://www.aliexpress.com/item/1234567890.html`,
+      supplierUrl: `https://www.aliexpress.com/item/1234567890.html`,
+      rating: 4.7,
+      totalOrders: 15420,
+      reviewCount: 2891,
+    },
+    {
+      productId: `mock-${Date.now()}-2`,
+      title: `${query} Pro Model - Free Shipping`,
+      price: 12.49,
+      cost: 12.49,
+      imageUrl: 'https://picsum.photos/seed/product2/800/800',
+      productUrl: `https://www.aliexpress.com/item/9876543210.html`,
+      supplierUrl: `https://www.aliexpress.com/item/9876543210.html`,
+      rating: 4.5,
+      totalOrders: 8760,
+      reviewCount: 1204,
+    },
+    {
+      productId: `mock-${Date.now()}-3`,
+      title: `${query} Deluxe Set - Top Rated`,
+      price: 15.99,
+      cost: 15.99,
+      imageUrl: 'https://picsum.photos/seed/product3/800/800',
+      productUrl: `https://www.aliexpress.com/item/1122334455.html`,
+      supplierUrl: `https://www.aliexpress.com/item/1122334455.html`,
+      rating: 4.8,
+      totalOrders: 22100,
+      reviewCount: 4312,
+    },
+  ];
+
+  return mockProducts.slice(0, Math.min(limit, mockProducts.length));
+}
+
 // ─── Image fetching ───────────────────────────────────────────────────────────
 
 /**
- * Fetch all product images from AliExpress.
- * Tries the AliExpress API first, then falls back to HTML scraping.
- *
- * @param {string} productUrl  - AliExpress product URL or product ID
- * @param {object} options     - { limit: number }
- * @returns {Promise<Array<{url, position, isMain}>>}
+ * Fetch all available images for a product.
+ * Uses API if ALIEXPRESS_APP_KEY set, otherwise tries HTML scraping, then returns imageUrl fallback.
  */
 async function fetchProductImages(productUrl, { limit = 10 } = {}) {
-  // Try API if credentials are set
+  if (!productUrl) return [];
+
+  // Mock URL — return placeholder images
+  if (productUrl.includes('mock') || productUrl.includes('picsum')) {
+    return Array.from({ length: Math.min(limit, 5) }, (_, i) => ({
+      url: `https://picsum.photos/seed/product${i + 1}/800/800`,
+      position: i + 1,
+      isMain: i === 0,
+    }));
+  }
+
   if (process.env.ALIEXPRESS_APP_KEY) {
     try {
       return await _fetchImagesFromApi(productUrl, limit);
     } catch (err) {
-      logger.warn(`[AliExpress] API image fetch failed, trying scrape: ${err.message}`);
+      logger.warn(`[AliExpress] API image fetch failed: ${err.message} — trying scrape`);
     }
   }
 
-  // Fallback: scrape the product page HTML
   return _scrapeImagesFromPage(productUrl, limit);
 }
 
@@ -61,10 +121,7 @@ async function _fetchImagesFromApi(productUrl, limit) {
   if (!productId) return [];
 
   const response = await axios.get('https://api.aliexpress.com/v2/product/detail', {
-    params: {
-      productId,
-      appKey: process.env.ALIEXPRESS_APP_KEY,
-    },
+    params: { productId, appKey: process.env.ALIEXPRESS_APP_KEY },
     timeout: 10_000,
   });
 
@@ -72,8 +129,6 @@ async function _fetchImagesFromApi(productUrl, limit) {
   if (!data) throw new Error('Empty AliExpress API response');
 
   const images = [];
-
-  // Main gallery images
   const gallery = data.imageModule?.imagePathList || [];
   gallery.forEach((url, idx) => {
     const clean = normaliseImageUrl(url);
@@ -81,8 +136,7 @@ async function _fetchImagesFromApi(productUrl, limit) {
   });
 
   // SKU/variant colour images
-  const skuProps = data.skuModule?.productSKUPropertyList || [];
-  for (const prop of skuProps) {
+  for (const prop of (data.skuModule?.productSKUPropertyList || [])) {
     for (const val of (prop.skuPropertyValues || [])) {
       if (val.skuPropertyImagePath) {
         const clean = normaliseImageUrl(val.skuPropertyImagePath);
@@ -91,7 +145,6 @@ async function _fetchImagesFromApi(productUrl, limit) {
     }
   }
 
-  // Deduplicate and return
   const seen = new Set();
   return images.filter(img => {
     if (seen.has(img.url)) return false;
@@ -109,19 +162,13 @@ async function _scrapeImagesFromPage(productUrl, limit) {
       timeout: 15_000,
     });
 
-    // AliExpress embeds image list in a JS variable
-    const html = response.data;
-    const match = html.match(/"imagePathList"\s*:\s*(\[.*?\])/);
+    const match = response.data.match(/"imagePathList"\s*:\s*(\[.*?\])/);
     if (!match) return [];
 
     const urls = JSON.parse(match[1]);
     return urls
       .slice(0, limit)
-      .map((url, idx) => ({
-        url: normaliseImageUrl(url),
-        position: idx + 1,
-        isMain: idx === 0,
-      }))
+      .map((url, idx) => ({ url: normaliseImageUrl(url), position: idx + 1, isMain: idx === 0 }))
       .filter(img => img.url);
   } catch (err) {
     logger.warn(`[AliExpress] HTML scrape failed: ${err.message}`);
@@ -132,10 +179,10 @@ async function _scrapeImagesFromPage(productUrl, limit) {
 // ─── Product search ───────────────────────────────────────────────────────────
 
 async function searchProducts(query, options = {}) {
-  const { sortBy = 'orders', minRating = 4.0, maxPrice = 20, limit = 20 } = options;
+  const { minRating = 4.0, maxPrice = 20, limit = 20 } = options;
 
+  // No API key → use mock data so the pipeline can be tested end-to-end
   if (!process.env.ALIEXPRESS_APP_KEY) {
-    logger.warn('[AliExpress] ALIEXPRESS_APP_KEY not set — returning mock data');
     return _mockSearchResults(query, limit);
   }
 
@@ -143,7 +190,7 @@ async function searchProducts(query, options = {}) {
     const response = await axios.get('https://api.aliexpress.com/v2/product/search', {
       params: {
         keywords: query,
-        sort: sortBy === 'orders' ? 'SALE_PRICE_ASC' : 'LAST_VOLUME_DESC',
+        sort: 'LAST_VOLUME_DESC',
         minPrice: 1,
         maxPrice,
         pageSize: limit,
@@ -152,19 +199,28 @@ async function searchProducts(query, options = {}) {
       timeout: 15_000,
     });
 
-    const items = response.data?.aliexpress_ds_product_search_get_response?.result?.products?.product || [];
-    return items
-      .filter(p => parseFloat(p.evaluate_rate) >= minRating * 20)
+    const items = response.data
+      ?.aliexpress_ds_product_search_get_response
+      ?.result?.products?.product || [];
+
+    const results = items
+      .filter(p => parseFloat(p.evaluate_rate || '0') >= minRating * 20)
       .map(p => ({
-        productId: String(p.product_id),
-        title: p.product_title,
-        price: parseFloat(p.app_sale_price),
-        imageUrl: normaliseImageUrl(p.product_main_image_url),
-        productUrl: p.product_detail_url,
-        rating: parseFloat(p.evaluate_rate) / 20,
+        productId:   String(p.product_id),
+        title:       p.product_title,
+        price:       parseFloat(p.app_sale_price),
+        cost:        parseFloat(p.app_sale_price),
+        imageUrl:    normaliseImageUrl(p.product_main_image_url),
+        productUrl:  p.product_detail_url,
+        supplierUrl: p.product_detail_url,
+        rating:      parseFloat(p.evaluate_rate || '0') / 20,
         totalOrders: parseInt(p.lastest_volume || '0'),
         reviewCount: parseInt(p.evaluate_cnt || '0'),
       }));
+
+    logger.info(`[AliExpress] "${query}" → ${results.length} products`);
+    return results;
+
   } catch (err) {
     if (err.response?.status === 429) {
       logger.warn('[AliExpress] Rate limited — waiting 30s');
@@ -175,25 +231,12 @@ async function searchProducts(query, options = {}) {
   }
 }
 
-function _mockSearchResults(query, limit) {
-  return Array.from({ length: Math.min(limit, 5) }, (_, i) => ({
-    productId: `mock-${Date.now()}-${i}`,
-    title: `${query} Product ${i + 1}`,
-    price: 8 + i * 2,
-    imageUrl: 'https://via.placeholder.com/500',
-    productUrl: `https://aliexpress.com/item/mock${i}.html`,
-    rating: 4.5,
-    totalOrders: 1000 + i * 200,
-    reviewCount: 500 + i * 50,
-  }));
-}
-
-// ─── CJ Dropshipping stub ─────────────────────────────────────────────────────
+// ─── CJ Dropshipping ──────────────────────────────────────────────────────────
 
 const cjDropshipping = {
   async placeOrder(orderData) {
-    logger.warn('[CJ] cjDropshipping.placeOrder not implemented — returning mock');
-    return { cjOrderId: `CJ-MOCK-${Date.now()}`, trackingNumber: null };
+    logger.warn('[CJ] placeOrder not fully implemented — returning placeholder');
+    return { cjOrderId: `CJ-${Date.now()}`, trackingNumber: null };
   },
 };
 

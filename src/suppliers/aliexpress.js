@@ -178,6 +178,17 @@ async function _scrapeImagesFromPage(productUrl, limit) {
 
 // ─── Product search ───────────────────────────────────────────────────────────
 
+const crypto = require('crypto');
+
+function signRequest(params, appSecret) {
+  const sorted = Object.keys(params).sort().map(k => `${k}${params[k]}`).join('');
+  return crypto
+    .createHmac('sha256', appSecret)
+    .update(sorted)
+    .digest('hex')
+    .toUpperCase();
+}
+
 async function searchProducts(query, options = {}) {
   const { minRating = 4.0, maxPrice = 20, limit = 20 } = options;
 
@@ -185,52 +196,81 @@ async function searchProducts(query, options = {}) {
     return _mockSearchResults(query, limit);
   }
 
+  const appKey    = process.env.ALIEXPRESS_APP_KEY;
+  const appSecret = process.env.ALIEXPRESS_APP_SECRET;
+
+  if (!appSecret) {
+    logger.error('[AliExpress] ALIEXPRESS_APP_SECRET is not set — required for signed requests');
+    return [];
+  }
+
   try {
-    const response = await axios.get('https://api.aliexpress.com/v2/product/search', {
-      params: {
-        keywords:  query,
-        sort:      'LAST_VOLUME_DESC',
-        minPrice:  1,
-        maxPrice,
-        pageSize:  limit,
-        appKey:    process.env.ALIEXPRESS_APP_KEY,
-      },
-      timeout: 15_000,
-    });
+    const params = {
+      app_key:          appKey,
+      method:           'aliexpress.affiliate.product.query',
+      sign_method:      'sha256',
+      timestamp:        new Date().toISOString().replace('T', ' ').slice(0, 19),
+      v:                '2.0',
+      format:           'json',
+      // ── search params ──
+      keywords:         query,
+      page_no:          '1',
+      page_size:        String(limit),
+      max_sale_price:   String(Math.round(maxPrice * 100)), // API wants cents
+      sort:             'LAST_VOLUME_DESC',
+      ship_to_country:  process.env.TARGET_COUNTRY || 'US',
+      target_currency:  process.env.TARGET_CURRENCY || 'USD',
+      target_language:  process.env.TARGET_LANGUAGE || 'EN',
+      tracking_id:      process.env.ALIEXPRESS_TRACKING_ID || appKey,
+    };
 
-    // ── FIX 1: try both response envelope keys ──────────────────────────────
-    const root = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-    logger.info(`[AliExpress] Parsed top-level keys: [${Object.keys(root).join(', ')}]`);
-    const resultBlock =
-      root?.aliexpress_affiliate_product_query_response?.resp_result?.result  // Affiliate API
-      ?? root?.aliexpress_ds_product_search_get_response?.result              // DS API
-      ?? null;
+    params.sign = signRequest(params, appSecret);
 
-    if (!resultBlock) {
-      // Log the actual envelope so you can see what key the API is really using
-      const topKeys = Object.keys(root || {});
-      logger.warn(`[AliExpress] Unexpected response shape for "${query}". Top-level keys: [${topKeys.join(', ')}]`);
-      logger.debug(`[AliExpress] Raw response (truncated): ${JSON.stringify(root).slice(0, 600)}`);
+    const response = await axios.post(
+      'https://api-sg.aliexpress.com/sync',
+      new URLSearchParams(params).toString(),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 15_000,
+      }
+    );
+
+    const root = typeof response.data === 'string'
+      ? JSON.parse(response.data)
+      : response.data;
+
+    // Check for API-level errors first
+    const errorResponse = root?.error_response;
+    if (errorResponse) {
+      logger.error(`[AliExpress] API error: ${errorResponse.msg} (code: ${errorResponse.code})`);
       return [];
     }
 
-    const items = resultBlock?.products?.product ?? [];
-    logger.info(`[AliExpress] "${query}" → ${items.length} raw items from API`);
+    const resultBlock =
+      root?.aliexpress_affiliate_product_query_response?.resp_result;
 
-    if (items.length === 0) return [];
+    if (!resultBlock) {
+      logger.warn(`[AliExpress] Unexpected shape. Keys: [${Object.keys(root).join(', ')}]`);
+      logger.debug(`[AliExpress] Raw: ${JSON.stringify(root).slice(0, 600)}`);
+      return [];
+    }
 
-    // ── FIX 2: normalise evaluate_rate regardless of 0–5 or 0–100 scale ────
+    if (resultBlock.resp_code !== 200) {
+      logger.error(`[AliExpress] Query failed: ${resultBlock.resp_msg}`);
+      return [];
+    }
+
+    const items = resultBlock.result?.products?.product ?? [];
+    logger.info(`[AliExpress] "${query}" → ${items.length} raw items`);
+    if (!items.length) return [];
+
     const normaliseRating = (raw) => {
       const n = parseFloat(raw || '0');
-      if (n === 0) return 0;
-      return n > 10 ? n / 20 : n;   // >10 means 0–100 scale → convert to 0–5
+      return n > 10 ? n / 20 : n;
     };
 
     const results = items
-      .filter(p => {
-        const rating = normaliseRating(p.evaluate_rate);
-        return rating >= minRating;
-      })
+      .filter(p => normaliseRating(p.evaluate_rate) >= minRating)
       .map(p => ({
         productId:   String(p.product_id),
         title:       p.product_title,
@@ -240,21 +280,17 @@ async function searchProducts(query, options = {}) {
         productUrl:  p.product_detail_url,
         supplierUrl: p.product_detail_url,
         rating:      normaliseRating(p.evaluate_rate),
-        totalOrders: parseInt(p.lastest_volume ?? p.orders ?? '0'),
+        totalOrders: parseInt(p.lastest_volume ?? '0'),
         reviewCount: parseInt(p.evaluate_cnt ?? '0'),
       }));
 
-    logger.info(`[AliExpress] "${query}" → ${results.length} products (after minRating ${minRating} filter)`);
+    logger.info(`[AliExpress] "${query}" → ${results.length} products (after rating filter)`);
     return results;
 
   } catch (err) {
     if (err.response?.status === 429) {
       logger.warn('[AliExpress] Rate limited — waiting 30s');
       await new Promise(r => setTimeout(r, 30_000));
-    }
-    // ── Log HTTP status + body for easier diagnosis ──────────────────────────
-    if (err.response) {
-      logger.error(`[AliExpress] HTTP ${err.response.status}: ${JSON.stringify(err.response.data).slice(0, 400)}`);
     }
     logger.error(`[AliExpress] searchProducts failed: ${err.message}`);
     return [];

@@ -199,7 +199,8 @@ async function searchProducts(query, options = {}) {
     });
 
     // ── FIX 1: try both response envelope keys ──────────────────────────────
-    const root = response.data;
+    const root = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    logger.info(`[AliExpress] Parsed top-level keys: [${Object.keys(root).join(', ')}]`);
     const resultBlock =
       root?.aliexpress_affiliate_product_query_response?.resp_result?.result  // Affiliate API
       ?? root?.aliexpress_ds_product_search_get_response?.result              // DS API

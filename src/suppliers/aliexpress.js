@@ -2,7 +2,7 @@
  * aliexpress.js — CJ Dropshipping Supplier Adapter (CJS)
  *
  * searchProducts() works in 3 modes:
- *   1. CJ Dropshipping API  — when CJ_EMAIL + CJ_API_KEY are set
+ *   1. CJ Dropshipping API  — when CJ_API_EMAIL + CJ_API_KEY are set
  *   2. Development mock data — when credentials are NOT set (clearly logged)
  *   3. Fallback              — on API error (rate limits etc.)
  *
@@ -42,8 +42,8 @@ function extractProductId(productUrl) {
  * without CJ Dropshipping credentials.
  */
 function _mockSearchResults(query, limit = 5) {
-  logger.warn(`[CJ] ⚠️  CJ_EMAIL / CJ_API_KEY not set — using mock data for "${query}"`);
-  logger.warn('[CJ] Set CJ_EMAIL and CJ_API_KEY in .env to search real products');
+  logger.warn(`[CJ] ⚠️  CJ_API_EMAIL / CJ_API_KEY not set — using mock data for "${query}"`);
+  logger.warn('[CJ] Set CJ_API_EMAIL and CJ_API_KEY in .env to search real products');
 
   const mockProducts = [
     {
@@ -98,7 +98,7 @@ async function getCJAccessToken() {
   const response = await axios.post(
     'https://developers.cjdropshipping.com/api2.0/v1/authentication/getAccessToken',
     {
-      email:    process.env.CJ_EMAIL,
+      email:    process.env.CJ_API_EMAIL,
       password: process.env.CJ_API_KEY,
     },
     { timeout: 10_000 }
@@ -134,7 +134,7 @@ async function fetchProductImages(productUrl, { limit = 10 } = {}) {
   }
 
   // CJ product — query the detail endpoint for full image list
-  if (productUrl.includes('cjdropshipping.com') && process.env.CJ_EMAIL) {
+  if (productUrl.includes('cjdropshipping.com') && process.env.CJ_API_EMAIL) {
     try {
       return await _fetchCJImages(productUrl, limit);
     } catch (err) {
@@ -166,9 +166,13 @@ async function _fetchCJImages(productUrl, limit) {
 
   const images = [];
 
-  // Main images
-  for (const [idx, url] of (product.productImageSet?.split(',') || []).entries()) {
-    const clean = normaliseImageUrl(url.trim());
+  // Main images — CJ returns productImageSet as either a comma-separated string or an array
+  const rawImages = Array.isArray(product.productImageSet)
+    ? product.productImageSet
+    : (product.productImageSet ?? '').split(',').filter(Boolean);
+
+  for (const [idx, url] of rawImages.entries()) {
+    const clean = normaliseImageUrl(typeof url === 'string' ? url.trim() : url);
     if (clean) images.push({ url: clean, position: idx + 1, isMain: idx === 0 });
   }
 
@@ -215,7 +219,7 @@ async function searchProducts(query, options = {}) {
   const { minRating = 4.0, maxPrice = 20, limit = 20 } = options;
 
   // No credentials → use mock data so the pipeline can be tested end-to-end
-  if (!process.env.CJ_EMAIL || !process.env.CJ_API_KEY) {
+  if (!process.env.CJ_API_EMAIL || !process.env.CJ_API_KEY) {
     return _mockSearchResults(query, limit);
   }
 
@@ -287,7 +291,7 @@ async function searchProducts(query, options = {}) {
 
 const cjDropshipping = {
   async placeOrder(orderData) {
-    if (!process.env.CJ_EMAIL || !process.env.CJ_API_KEY) {
+    if (!process.env.CJ_API_EMAIL || !process.env.CJ_API_KEY) {
       logger.warn('[CJ] placeOrder called but no credentials set — returning placeholder');
       return { cjOrderId: `CJ-MOCK-${Date.now()}`, trackingNumber: null };
     }

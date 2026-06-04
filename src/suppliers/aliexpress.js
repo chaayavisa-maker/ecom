@@ -87,6 +87,34 @@ function _mockSearchResults(query, limit = 5) {
   return mockProducts.slice(0, Math.min(limit, mockProducts.length));
 }
 
+// ─── CJ request throttle (QPS limit: 1 req/sec) ──────────────────────────────
+
+let _lastCJRequestAt = 0;
+
+async function _cjThrottle() {
+  const elapsed = Date.now() - _lastCJRequestAt;
+  if (elapsed < 1100) await new Promise(r => setTimeout(r, 1100 - elapsed));
+  _lastCJRequestAt = Date.now();
+}
+
+async function _cjGet(url, config, retries = 2) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    await _cjThrottle();
+    try {
+      return await axios.get(url, config);
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 429 && attempt < retries) {
+        const wait = attempt * 30_000;
+        logger.warn(`[CJ] Rate limited (attempt ${attempt}/${retries}) — waiting ${wait / 1000}s before retry`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ─── CJ Dropshipping auth ─────────────────────────────────────────────────────
 
 let _cjAccessToken = null;
@@ -152,7 +180,7 @@ async function _fetchCJImages(productUrl, limit) {
   const pid = pidMatch[1];
 
   const token = await getCJAccessToken();
-  const response = await axios.get(
+  const response = await _cjGet(
     'https://developers.cjdropshipping.com/api2.0/v1/product/query',
     {
       headers: { 'CJ-Access-Token': token },
@@ -226,7 +254,7 @@ async function searchProducts(query, options = {}) {
   try {
     const token = await getCJAccessToken();
 
-    const response = await axios.get(
+    const response = await _cjGet(
       'https://developers.cjdropshipping.com/api2.0/v1/product/list',
       {
         headers: { 'CJ-Access-Token': token },
@@ -275,10 +303,6 @@ async function searchProducts(query, options = {}) {
     return results;
 
   } catch (err) {
-    if (err.response?.status === 429) {
-      logger.warn('[CJ] Rate limited — waiting 30s');
-      await new Promise(r => setTimeout(r, 30_000));
-    }
     if (err.response) {
       logger.error(`[CJ] HTTP ${err.response.status}: ${JSON.stringify(err.response.data).slice(0, 400)}`);
     }

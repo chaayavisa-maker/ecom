@@ -1,13 +1,11 @@
 /**
- * listingAgent.js — Improved Listing Agent (CJS)
+ * listingAgent.js — Listing Agent
  *
- * Improvements over original:
- *  1. Multi-image support — fetches up to 10 images per product
- *  2. Image deduplication & CDN URL normalisation (full-res images)
- *  3. AI-generated alt text per image (SEO)
- *  4. Variant-to-image assignment after product creation
- *  5. Retry logic on Shopify API failures
- *  6. Exports .bulkProcess(products) matching run-agent.js expectation
+ * Change from previous version:
+ *   products are published immediately when AUTO_PUBLISH_PRODUCTS=true,
+ *   otherwise they remain as 'draft' for manual review.
+ *
+ * All other logic (multi-image, alt text, retry, pricing) is unchanged.
  */
 
 'use strict';
@@ -17,7 +15,7 @@ const { createProduct, addImagesToProduct, updateVariantImage } = require('../sh
 const { fetchProductImages } = require('../suppliers/aliexpress');
 const logger = require('../utils/logger');
 
-const MAX_IMAGES = 10;
+const MAX_IMAGES    = 10;
 const RETRY_ATTEMPTS = 3;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -72,7 +70,7 @@ Return a JSON object with:
     maxTokens: 500,
   });
   return {
-    tags: Array.isArray(result.tags) ? result.tags : [],
+    tags:     Array.isArray(result.tags)     ? result.tags     : [],
     altTexts: Array.isArray(result.altTexts) ? result.altTexts : [],
   };
 }
@@ -80,10 +78,9 @@ Return a JSON object with:
 // ─── Pricing ──────────────────────────────────────────────────────────────────
 
 function calculatePrice(cost) {
-  const markup = parseFloat(process.env.DEFAULT_MARKUP_PERCENT || '200') / 100;
-  const shippingBuffer = parseFloat(process.env.SHIPPING_BUFFER_USD || '5');
+  const markup         = parseFloat(process.env.DEFAULT_MARKUP_PERCENT || '200') / 100;
+  const shippingBuffer = parseFloat(process.env.SHIPPING_BUFFER_USD    || '5');
   const raw = (cost + shippingBuffer) * (1 + markup);
-  // Psychological pricing: ceil to next dollar then subtract 0.01
   return (Math.ceil(raw) - 0.01).toFixed(2);
 }
 
@@ -98,7 +95,7 @@ async function listProduct(product) {
   const productLabel = product.rawTitle || product.title || product.productId;
   logger.info(`[Listing] Processing: ${productLabel}`);
 
-  // 1. Fetch all available images
+  // 1. Fetch images
   let images = [];
   try {
     images = await withRetry(
@@ -109,74 +106,79 @@ async function listProduct(product) {
     logger.warn(`[Listing] Image fetch failed for "${productLabel}": ${err.message}`);
   }
 
-  // Fallback to single imageUrl if gallery fetch failed
   if (images.length === 0 && product.imageUrl) {
     images = [{ url: product.imageUrl, position: 1, isMain: true }];
   }
 
   logger.info(`[Listing] ${images.length} image(s) ready for "${productLabel}"`);
 
-  // 2. Generate AI content (title, description, tags, alt texts) in parallel
+  // 2. Generate AI content in parallel
   const [title, description, meta] = await Promise.all([
     generateTitle(product),
     generateDescription(product),
     generateTagsAndAltTexts(product, images.length).catch(() => ({ tags: [], altTexts: [] })),
   ]);
 
-  // 3. Build pricing
-  const cost = product.cost || product.price || 8;
-  const price = calculatePrice(cost);
+  // 3. Pricing
+  const cost      = product.cost || product.price || 8;
+  const price     = calculatePrice(cost);
   const compareAt = calculateCompareAt(price);
 
   // 4. Build Shopify images array
-  // shopify-api-node accepts images[] on product.create()
   const shopifyImages = images.map((img, idx) => ({
-    src: img.url,
-    alt: meta.altTexts[idx] || title,
+    src:      img.url,
+    alt:      meta.altTexts[idx] || title,
     position: idx + 1,
   }));
 
-  // 5. Build full product payload
+  // 5. Publish status — controlled by AUTO_PUBLISH_PRODUCTS in .env
+  //    'active'  → goes live immediately on your store
+  //    'draft'   → saved but not visible to shoppers
+  const publishStatus = process.env.AUTO_PUBLISH_PRODUCTS === 'true' ? 'active' : 'draft';
+
+  // 6. Build full Shopify product payload
   const payload = {
     title,
-    body_html: description,
-    vendor: product.vendor || process.env.STORE_VENDOR || 'Our Store',
+    body_html:    description,
+    vendor:       product.vendor || process.env.STORE_VENDOR || 'Our Store',
     product_type: product.category || product.niche || '',
-    tags: meta.tags.join(', '),
-    status: 'draft',  // Always draft — review before publishing
-    images: shopifyImages,
+    tags:         meta.tags.join(', '),
+    status:       publishStatus,
+    images:       shopifyImages,
     variants: [{
       price,
-      compare_at_price: compareAt,
+      compare_at_price:     compareAt,
       inventory_management: 'shopify',
-      inventory_quantity: product.stock || 50,
-      requires_shipping: true,
+      inventory_quantity:   product.stock || 50,
+      requires_shipping:    true,
     }],
     metafields: [
       {
         namespace: 'custom',
-        key: 'supplier_url',
-        value: product.supplierUrl || product.productUrl || '',
-        type: 'single_line_text_field',
+        key:       'supplier_url',
+        value:     product.supplierUrl || product.productUrl || '',
+        type:      'single_line_text_field',
       },
       {
         namespace: 'custom',
-        key: 'supplier_cost',
-        value: String(cost),
-        type: 'number_decimal',
+        key:       'supplier_cost',
+        value:     String(cost),
+        type:      'number_decimal',
       },
       {
         namespace: 'custom',
-        key: 'last_synced',
-        value: new Date().toISOString(),
-        type: 'single_line_text_field',
+        key:       'last_synced',
+        value:     new Date().toISOString(),
+        type:      'single_line_text_field',
       },
     ],
   };
 
-  // 6. Create the product
+  // 7. Create the product on Shopify
   const created = await withRetry(() => createProduct(payload), 'createProduct');
-  logger.info(`[Listing] ✅ Created "${title}" (ID: ${created.id}) with ${shopifyImages.length} image(s)`);
+  logger.info(
+    `[Listing] ✅ Created "${title}" (ID: ${created.id}) — status: ${publishStatus} — ${shopifyImages.length} image(s)`
+  );
 
   return created;
 }
@@ -188,19 +190,16 @@ class ListingAgent {
     this.name = 'ListingAgent';
   }
 
-  /**
-   * Process a batch of products from the research agent.
-   * Called by run-agent.js as: listingAgent.bulkProcess(products)
-   */
   async bulkProcess(products) {
-    logger.info(`🤖 ${this.name} started — listing ${products.length} product(s) [provider: ${ai.providerName}]`);
+    const publishMode = process.env.AUTO_PUBLISH_PRODUCTS === 'true' ? 'LIVE' : 'DRAFT';
+    logger.info(`🤖 ${this.name} started — listing ${products.length} product(s) as ${publishMode} [provider: ${ai.providerName}]`);
     const results = { created: 0, failed: 0 };
 
     for (const product of products) {
       try {
         await listProduct(product);
         results.created++;
-        await sleep(1000); // Pace between Shopify API calls
+        await sleep(1000); // Pace Shopify API calls
       } catch (err) {
         logger.error(`[Listing] Failed to list "${product.rawTitle || product.title}": ${err.message}`);
         results.failed++;
@@ -211,9 +210,6 @@ class ListingAgent {
     return results;
   }
 
-  /**
-   * List a single product (convenience method).
-   */
   async run(products = []) {
     return this.bulkProcess(products);
   }

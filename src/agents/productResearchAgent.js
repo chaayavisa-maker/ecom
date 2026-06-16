@@ -1,29 +1,39 @@
 /**
- * productResearchAgent.js — Fixed Product Research Agent (CJS)
+ * productResearchAgent.js — Product Research Agent
  *
- * Fixes in this version:
- *  1. Scoring fallback no longer kills all products:
- *     - When AI scoring fails → products get score:65, confidence:'medium' (pass the filter)
- *     - Filter threshold lowered to 50 when in mock/dev mode (no API key)
- *  2. De-duplication gracefully handles Shopify 402 / plan limits
- *  3. Exports .run() matching run-agent.js
+ * Niche selection now follows a 3-step priority:
+ *   1. Approved niches from niche.config.json  → used immediately
+ *   2. No approved niches yet                  → AI generates suggestions,
+ *      saves them as 'pending', logs prompt to run `npm run niches`
+ *   3. While awaiting first approval           → falls back to safe defaults
+ *
+ * Other fixes retained from previous version:
+ *   - AI scoring fallback (score:65) so pipeline never stalls
+ *   - De-dup handles Shopify 402 / plan limits gracefully
+ *   - Exports .run() for compatibility with run-agent.js
  */
 
 'use strict';
 
-const ai = require('../utils/aiProvider');
-const { searchProducts } = require('../suppliers/aliexpress');
-const { getShopifyClient } = require('../shopify/client');
+const ai          = require('../utils/aiProvider');
+const nicheConfig = require('../config/niches');
+const { searchProducts }       = require('../suppliers/aliexpress');
+const { getShopifyClient }     = require('../shopify/client');
 const logger = require('../utils/logger');
 
-const MAX_PRODUCTS_PER_RUN = parseInt(process.env.MAX_PRODUCTS_PER_RUN || '10');
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const IS_MOCK_MODE = !process.env.ALIEXPRESS_APP_KEY;
+const MAX_PRODUCTS_PER_RUN = parseInt(process.env.MAX_PRODUCTS_PER_RUN || '10', 10);
+const CACHE_TTL_MS         = 24 * 60 * 60 * 1000;
+const IS_MOCK_MODE         = !process.env.ALIEXPRESS_APP_KEY;
 
 // Score threshold: be lenient in mock/dev mode
 const SCORE_THRESHOLD = IS_MOCK_MODE ? 0 : 60;
 
-const NICHE_BLACKLIST = [
+// Built-in fallback niches used only while awaiting first approval
+const DEFAULT_NICHES = ['portable blenders', 'pet accessories', 'desk organisers'];
+
+// These are passed to the AI to avoid suggesting oversaturated products.
+// Rejected niches from niche.config.json are added automatically at runtime.
+const STATIC_BLACKLIST = [
   'fidget spinner', 'phone case generic', 'led strip lights', 'posture corrector',
 ];
 
@@ -32,15 +42,13 @@ const researchCache = new Map();
 // ─── De-duplication ───────────────────────────────────────────────────────────
 
 async function loadExistingSupplierUrls() {
-  // Skip on mock mode — no real products to de-dup against
   if (IS_MOCK_MODE) return new Set();
 
   const shopify = getShopifyClient();
-  const urls = new Set();
+  const urls    = new Set();
 
   try {
-    // Use product list + metafield approach compatible with all Shopify plans
-    let page = await shopify.product.list({ limit: 250, fields: 'id,metafields' });
+    const page = await shopify.product.list({ limit: 250, fields: 'id,metafields' });
     for (const product of page) {
       for (const mf of (product.metafields || [])) {
         if (mf.namespace === 'custom' && mf.key === 'supplier_url') {
@@ -49,7 +57,6 @@ async function loadExistingSupplierUrls() {
       }
     }
   } catch (err) {
-    // 402 = plan doesn't support this endpoint; 403 = permissions; either way, skip dedup
     logger.warn(`[Research] De-duplication skipped: ${err.message}`);
   }
 
@@ -62,22 +69,26 @@ async function loadExistingSupplierUrls() {
 async function generateNiches(blacklist) {
   const result = await ai.chatJSON({
     system: 'You are a dropshipping product researcher. Respond ONLY with a valid JSON array of strings.',
-    prompt: `Identify 5 promising dropshipping product niches.
-Requirements: high demand, not oversaturated, margins >200%, ships easily, not seasonal.
-Skip: ${blacklist.join(', ')}
-Return: ["niche 1", "niche 2", "niche 3", "niche 4", "niche 5"]`,
+    prompt: `Identify 5 promising dropshipping product niches for 2025.
+Requirements: high demand, not oversaturated, margins >200%, ships easily, not seasonal, good repeat-buy potential.
+Skip these (too saturated or blacklisted): ${blacklist.join(', ')}
+Return ONLY: ["niche 1", "niche 2", "niche 3", "niche 4", "niche 5"]`,
     maxTokens: 150,
   });
-  return Array.isArray(result) ? result : ['portable blenders', 'pet accessories', 'desk organisers', 'phone stands', 'reusable water bottles'];
+
+  if (!Array.isArray(result) || result.length === 0) {
+    throw new Error('AI returned empty niche list');
+  }
+  return result;
 }
 
 async function scoreProducts(products, niche) {
   const candidates = products.map(p => ({
-    id: p.productId,
-    title: p.title,
-    price: p.price,
-    orders: p.totalOrders,
-    rating: p.rating,
+    id:      p.productId,
+    title:   p.title,
+    price:   p.price,
+    orders:  p.totalOrders,
+    rating:  p.rating,
     reviews: p.reviewCount,
   }));
 
@@ -99,12 +110,51 @@ Return: [{"id":"...","score":75,"confidence":"high|medium|low","reason":"one sen
   return Array.isArray(result) ? result : [];
 }
 
+// ─── Niche selection ──────────────────────────────────────────────────────────
+
+async function selectNiches() {
+  // 1. Use niches you've already approved
+  const approved = nicheConfig.getApprovedNiches();
+  if (approved.length > 0) {
+    logger.info(`[Research] ✅ Using ${approved.length} approved niche(s): ${approved.join(', ')}`);
+    return approved;
+  }
+
+  // 2. No approved niches — ask AI for suggestions and queue them for review
+  const expiredNiches = nicheConfig.getExpiredNiches();
+  if (expiredNiches.length > 0) {
+    logger.info(`[Research] Previous niches have expired: ${expiredNiches.join(', ')}`);
+  }
+
+  const rejectedNames   = nicheConfig.getRejectedNames();
+  const fullBlacklist   = [...STATIC_BLACKLIST, ...rejectedNames];
+
+  if (!nicheConfig.hasPendingNiches()) {
+    // Generate and queue new suggestions
+    try {
+      const suggestions = await generateNiches(fullBlacklist);
+      const added = nicheConfig.savePendingNiches(suggestions);
+      logger.info(`[Research] 💡 AI suggested ${added} niche(s) — run \`npm run niches\` to approve them`);
+      logger.info(`[Research]    Suggestions: ${suggestions.join(', ')}`);
+    } catch (err) {
+      logger.warn(`[Research] Niche suggestion failed: ${err.message}`);
+    }
+  } else {
+    const pendingCount = nicheConfig.getPendingNiches().length;
+    logger.warn(`[Research] ⏳ ${pendingCount} niche suggestion(s) still pending — run \`npm run niches\` to approve`);
+  }
+
+  // 3. Nothing approved yet — use safe defaults so the pipeline keeps running
+  logger.warn(`[Research] Using default niches while awaiting approval: ${DEFAULT_NICHES.join(', ')}`);
+  return DEFAULT_NICHES;
+}
+
 // ─── Core research ────────────────────────────────────────────────────────────
 
 async function researchNiche(niche, existingUrls) {
   const cached = researchCache.get(niche);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-    logger.info(`[Research] Using cached results for "${niche}"`);
+    logger.info(`[Research] Cache hit for "${niche}"`);
     return cached.products;
   }
 
@@ -114,16 +164,15 @@ async function researchNiche(niche, existingUrls) {
   });
 
   if (!rawProducts || rawProducts.length === 0) {
-    logger.warn(`[Research] No products returned for niche: ${niche}`);
+    logger.warn(`[Research] No products returned for: ${niche}`);
     return [];
   }
 
-  // De-duplicate against existing listings
   const newProducts = rawProducts.filter(p => !existingUrls.has(p.productUrl || p.supplierUrl));
   logger.info(`[Research] ${rawProducts.length} found, ${newProducts.length} new for "${niche}"`);
   if (!newProducts.length) return [];
 
-  // AI scoring — with safe fallback that doesn't kill the pipeline
+  // AI scoring with fallback so the pipeline never stalls
   let scoreMap = {};
   try {
     const scores = await scoreProducts(newProducts, niche);
@@ -134,14 +183,13 @@ async function researchNiche(niche, existingUrls) {
       throw new Error('Empty score array');
     }
   } catch (err) {
-    // ── KEY FIX: fallback gives passing scores, not 'low' confidence ──
-    logger.warn(`[Research] AI scoring failed for "${niche}" — using default scores: ${err.message}`);
+    logger.warn(`[Research] AI scoring fell back to defaults for "${niche}": ${err.message}`);
     scoreMap = Object.fromEntries(
       newProducts.map(p => [p.productId, {
-        id: p.productId,
-        score: 65,           // above the 60 threshold
-        confidence: 'medium', // not 'low', so it passes the filter
-        reason: 'AI scoring unavailable — using default pass score',
+        id:         p.productId,
+        score:      65,
+        confidence: 'medium',
+        reason:     'AI scoring unavailable — default pass score',
       }])
     );
   }
@@ -149,19 +197,19 @@ async function researchNiche(niche, existingUrls) {
   const scored = newProducts
     .map(p => ({
       ...p,
-      score:       scoreMap[p.productId]?.score || 65,
+      score:       scoreMap[p.productId]?.score      || 65,
       confidence:  scoreMap[p.productId]?.confidence || 'medium',
-      scoreReason: scoreMap[p.productId]?.reason || '',
+      scoreReason: scoreMap[p.productId]?.reason     || '',
     }))
     .filter(p => p.score >= SCORE_THRESHOLD)
     .sort((a, b) => b.score - a.score);
 
-  logger.info(`[Research] ${scored.length} products passed threshold (>=${SCORE_THRESHOLD}) for "${niche}"`);
+  logger.info(`[Research] ${scored.length} product(s) passed threshold (>=${SCORE_THRESHOLD}) for "${niche}"`);
   researchCache.set(niche, { products: scored, timestamp: Date.now() });
   return scored;
 }
 
-// ─── Agent class ──────────────────────────────────────────────────────────────
+// ─── Agent ────────────────────────────────────────────────────────────────────
 
 class ProductResearchAgent {
   constructor() {
@@ -170,30 +218,19 @@ class ProductResearchAgent {
 
   async run() {
     const startTime = Date.now();
+
     if (IS_MOCK_MODE) {
-      logger.warn('🔧 [Research] Running in MOCK MODE — set ALIEXPRESS_APP_KEY for real products');
+      logger.warn('🔧 [Research] MOCK MODE — set ALIEXPRESS_APP_KEY for live products');
     }
     logger.info(`🤖 ${this.name} started [provider: ${ai.providerName}]`);
 
     const allProducts = [];
 
     try {
-      const existingUrls = await loadExistingSupplierUrls();
-
-      // Pick niches
-      let niches;
-      if (process.env.FIXED_NICHES) {
-        niches = process.env.FIXED_NICHES.split(',').map(n => n.trim());
-        logger.info(`[Research] Using FIXED_NICHES: ${niches.join(', ')}`);
-      } else {
-        try {
-          niches = await generateNiches(NICHE_BLACKLIST);
-          logger.info(`[Research] AI selected niches: ${niches.join(', ')}`);
-        } catch (err) {
-          niches = ['portable blenders', 'pet accessories', 'desk organisers'];
-          logger.warn(`[Research] Niche generation failed, using defaults: ${err.message}`);
-        }
-      }
+      const [existingUrls, niches] = await Promise.all([
+        loadExistingSupplierUrls(),
+        selectNiches(),
+      ]);
 
       for (const niche of niches) {
         try {
@@ -212,11 +249,7 @@ class ProductResearchAgent {
         .slice(0, MAX_PRODUCTS_PER_RUN);
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      logger.info(`✅ ${this.name} complete in ${elapsed}s — ${topProducts.length} product(s) queued for listing`);
-
-      if (IS_MOCK_MODE && topProducts.length > 0) {
-        logger.warn(`🔧 [Research] ${topProducts.length} MOCK products will create DRAFT listings — safe to review before publishing`);
-      }
+      logger.info(`✅ ${this.name} done in ${elapsed}s — ${topProducts.length} product(s) queued for listing`);
 
       return topProducts;
 

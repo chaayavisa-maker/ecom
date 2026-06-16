@@ -1,0 +1,14 @@
+{
+  "niches": [
+    {
+      "name": "digital gadgets",
+      "status": "approved",
+      "suggestedAt": "2026-06-16T12:48:55.828Z",
+      "approvedAt": "2026-06-16T12:48:55.829Z"
+    }
+  ],
+  "meta": {
+    "createdAt": "2026-06-16T12:48:55.828Z",
+    "updatedAt": "2026-06-16T12:48:55.829Z"
+  }
+}
